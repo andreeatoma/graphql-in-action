@@ -1,0 +1,124 @@
+Resolving relations
+
+The remaining fields on the Task type are author and approachList. We’ll need to implement two new GraphQL types for them. I’ll name them Author and Approach.
+These fields will not be leaf fields in a query. They represent RELATIONS.
+
+A Task has one Author and many Approaches. To resolve these fields, the GraphQL server will have to execute SQL statements over many tables and return objects from these tables.
+
+When we’re done implementing the author and approachList fields, the API server should accept and reply to this query.
+
+{
+taskMainList {
+id
+content
+tags
+approachCount
+createdAt
+author {
+id
+username
+name
+}
+approachList {
+id
+content
+voteCount
+createdAt
+author {
+id
+username
+name
+}
+} }
+}
+
+This is the complete query that should be supported by the API service. Note the nested fields Task –> Author and Task –> Approach –> Author.
+An Approach also has an Author. To complete the taskMainList field, we will have to implement that relation as well.
+
+With this query, we would like to get all the information about all the latest Tasks, who authored them, what approaches are defined on them, and who authored these approaches.
+
+NOTE The Latest Tasks UI view will not include Approaches. Approaches will be displayed only in the Single Task UI view. For simplicity, I used one Task type here, but type specificity can be used to match expected usage and enforce the acceptable ways to use the API. We’ll see an example under the me root field.
+
+Resolving a one-to-one relation
+
+===========IMPORTANT=========
+
+The author field has to be resolved from the azdev.users table.
+
+The foreign key that connects a Task object to a User object is the user_id field on the azdev.tasks table.
+
+==============================
+
+When we resolved the taskMainList field with a list of Task objects, each of these objects had a value in its userId property. For each one, we have to execute another SQL statement to get information about the User who authored it. You can find that SQL statement under sqls.usersFromIds (in api/src/db/sqls.js).
+
+// $1: userIds
+usersFromIds: ` SELECT id, username, first_name AS "firstName", last_name AS "lastName", created_at AS "createdAt" FROM azdev.users WHERE id = ANY ($1)`,
+Note that this SQL statement has a $1 in it. This is new. It’s the syntax we can use with the pg driver to insert a variable into the SQL statement without resorting to string concatenation. The statement is expected to be executed with one variable, and that variable will be used to replace the $1 part.
+
+The ANY comparison construct can be used to fetch multiple records from the database using an array of IDs. This is going to help us reduce the number of SQL queries that the API server needs to execute. We’ll see examples in chapter 7.
+
+Next we need to design a function in the pgApi module to execute the sqls .usersFromIds statement. Let’s design that function to accept a userId value as an argument.
+
+The sqls.usersFromIds statement is designed to work with multiple user IDs and return multiple user records. That’s why the $1 value was [userId].
+
+However, since we’re passing only a single userId value, the SQL statement will fetch one row or nothing (because the ID column is unique). The pg driver always returns the rows property on its response as an array, even when it’s just one row. That’s why the returned value was the first row from the statement’s response (pgResp.rows[0]).
+
+To make the GraphQL server aware of the new author field, we need to define the User type. Everything in a GraphQL schema must have a type. In the SDL text, we had this structure for the User type.
+
+type User {
+id: ID!
+username: String!
+name: String
+taskList: [Task!]!
+}
+===============IMPORTANT=============
+
+We’ll implement the taskList field under the me root field.
+
+Remember the three steps we went through for the Task type? We need to do something similar for the User type:
+
+1 Define a new object type named User, which has the three scalar fields.
+2 Write any non-default resolvers for the User type. Let’s combine the database first_name and last_name columns on table azdev.users into a single name field for the API.
+3 Modify the Task type to have a field named author that is a non-null object of
+type User (the new type), and resolve this field with a record from the azdev.users table using the new userInfo function in listing 6.26.
+
+THE N+1 QUERIES PROBLEM
+
+Why are we executing six SQL queries? Because we have one main query (for Tasks), and we have five public Task records in the sample data. For each Task record, we’re asking the database about its associated User record. That’s five queries for Users plus the main query. This 5 + 1 is the N+1 problem. If we had 41 public Task objects in the azdev.tasks table, we would be executing 42 SQL queries here.
+
+Clearly this is a problem. We should not be doing that. There are many ways to fix this issue. I’ll show you one of them here, and we will see a better one in the next chapter.
+An easy way to fix this problem is through the direct use of database joins (or database views based on joins). Database joins are powerful.
+You can form a single SQL query that gets information from two or more tables at once.
+
+For example, if we’re to find a Task record and get the information for its associated User in the same SQL response, we can do a join like this (you can put this in api/src/db/sqls.js).
+
+const views = {
+tasksAndUsers: `  SELECT t.*,
+        u.id AS "author_id",
+        u.username AS "author_username",
+        u.first_name AS "author_firstName",
+        u.last_name AS "author_lastName",
+        u.created_at AS "author_createdAt"
+    FROM azdev.tasks t
+    JOIN azdev.users u ON (t.user_id = u.id)`,
+};
+
+The tasksAndUsers string can act like a view, and we can use it to create an actual database view object if we want to. However, let’s just use it inline for this example.
+
+Note that I used column aliases to prefix the users table columns with "author\_". If we don’t do that, there might be a conflict in column names (for example, both tables have an id field). This prefixing will also make it easier for us to implement the GraphQL resolvers for this relation.
+
+To use the tasksAndUsers view, instead of selecting from the azdev.tasks table for the sqls.tasksLatest SQL query, we can select from the new tasksAndUsers view.
+
+taskMainList: `  SELECT id, content, tags, ·-·-·
+    "author_id", "author_username", "author_firstName",
+"author_lastName", "author_createdAt" FROM (${views.tasksAndUsers})
+WHERE is_private = FALSE
+ORDER BY created_at DESC
+LIMIT 100`,
+
+With that, the parent source object used to resolve the Task type will also have author\_-prefixed columns that hold the author information inline in the same object. No further SQL queries are necessary. However, we need to extract the prefixed col- umns into an object suitable to be the parent source object for the User type resolvers. Let’s create a utility function to do that. I’ll name it extractPrefixedColumns. Here’s how we will use it in the Task type.
+
+Resolving a one-to-many relation
+
+We’ll implement the approachList field starting from the types and resolvers. We need to modify the Task type to add the new approachList field. That field is a non- null list of non-null Approach objects (which is the new GraphQL type we need to introduce). To resolve the approachList field, we need a new function in pgApi that takes a taskId and returns an array of Approach objects associated with it. Let’s name that function approachList.
+

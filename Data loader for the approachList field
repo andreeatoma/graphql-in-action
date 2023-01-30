@@ -1,0 +1,70 @@
+The loader for the approachList field
+
+The other ID-based fetching we have done so far is in the pgApi.approachList func- tion in api/src/db/pg-api.js. This function is a bit different than the pgApi .usersInfo function as it takes a taskId and returns an array of Approach records. This means when we switch it to work with an array of keys instead of a single value, it will take an array of taskIds, and it should return an array of arrays (each array repre- senting the list of Approaches for one Task).
+DataLoader, in this case, will be concerned about the order of the top-level array. The order of the items in the inner-level arrays is an application-level concern.
+sqls.approachesForTaskIds accepts an array of Task IDs, but it will return a sin- gle list of all the Approach records under all the input Task IDs. We’ll need to split this list and group Approach records by Task IDs while keeping the order of the top-level array matching the order of the input array.
+
+Single resource fields
+
+In our schema plan, the taskInfo root query root field is supposed to fetch the infor- mation for a single Task record identified by an ID that the API consumer can send as a field argument.
+
+type Query {
+taskInfo(id: ID!): Task
+// ·-·-·
+}
+
+query taskInfoTest {
+taskInfo(id: 3) {
+id
+content
+author {
+id }
+approachList {
+content
+} }
+}
+
+Note that this field has to support the nested author and approachList information. But guess what? We don’t need to do anything new. We have already implemented these relationships under taskMainList. The taskInfo field uses the same output type (Task).
+
+You might be tempted to think that since this taskInfo field works with a single record, there is no need to use DataLoader for it. However, using DataLoader is pref- erable for many reasons. For one thing, having all database fetch requests go through DataLoader is simply a good code abstraction practice, but there is still performance value for composite queries. For example, take a look at this query.
+
+query manyTaskInfoTest {
+task1: taskInfo(id: 1) {
+id
+content
+author {
+id }
+}
+task2: taskInfo(id: 2) {
+id
+content
+author {
+id }
+}
+}
+
+If we don’t use a DataLoader instance for the taskInfo field, this query will ask the database about two Task records using two SQL statements. With a DataLoader instance, these two statements are batched into one.
+
+Let’s make this change with a top-down approach this time (so far, we’ve been using a bottom-up approach). We’ll first define the taskInfo root query (in the new api/src/schema/queries.js file). Note that—for the first time so far—we’re going to use a field argument (the id argument for taskInfo). In the definition of the taskInfo field, we have to include the type of that id argument. We can use the GraphQLID type for it.
+
+        // $1: taskIds
+        // $2: userId (can be null)
+        tasksFromIds: `
+          SELECT ...
+          FROM azdev.tasks
+          WHERE id = ANY ($1)
+          AND (is_private = FALSE OR user_id = $2)
+
+`,
+Something new and important is introduced in this statement. It takes two variables: one is the IDs of tasks to be loaded, and the other is a userId argument. The query will then make sure the looked-up Task is either public or owned by the user identified by the userId value. Without that condition, private Tasks can be looked up using the taskInfo field (which will use this SQL statement).
+
+This SQL statement can be used without a userId value (which is what we need to do first); for that case, it will only fetch information about public Task records.
+Here’s the pgApi DataLoader-compatible function to execute the SQL statement.
+
+Circular dependencies in GraphQL types
+
+We designed the Approach type to have a task field so that we can display the parent Task information when a search result item is an Approach record. To implement this relation, we can reuse the loaders and pgApi function we wrote for the taskInfo root field.
+However, this relation is the inverse of the Task –> Approach relation we implemented for the approachList field. This means it will introduce a circular dependency in the graph: Task –> Approach –> Task –> Approach –> ...
+To see this problem in action, let’s try to implement the new relation. The only change we need to make is the Approach type.
+
+Since the Approach type now needs to use the Task type, and since that Task type already uses the Approach type, the Approach type will hit the circular dependency problem. Check it out: here are the necessary changes.

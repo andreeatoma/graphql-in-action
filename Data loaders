@@ -1,0 +1,98 @@
+Data loaders
+
+Caching and batching
+
+To analyze a solution to this problem, let’s go back to the simpler query from listing
+
+{
+taskMainList {
+content
+author {
+id
+username
+name
+}
+}
+}
+
+If you remember, this query was issuing six SQL SELECT statements to the database, which is an example of the N+1 problem (N being five Task records). We’ve seen how to use database join views to make it execute only one SQL statement, but that solu- tion is not ideal. It’s not easy to maintain or scale.
+
+Another solution is to use the concepts of caching and batching for all the neces- sary SQL statements in a single GraphQL operation:
+
+CACHING
+
+The least we can do is CACHE THE RESPONSE OF ANY SQL STATEMENTS issued and then use the cache the next time we need the EXACT same SQL statement. If we ask the database about user x, do not ask it again about user x; just use the previous response.
+
+Because the GraphQL runtime traverses the tree field by field and resolves each field on its own as it does, this simple GraphQL query resulted in a lot more SQL statements than necessary.
+
+Doing this in a single API request (from one consumer) is a no-brainer, but you can also use longer-term, multisession caching if you need to optimize things further. However, caching by itself is not enough. We also need to group queries asking for data from the same tables.
+
+BATCHING
+
+We can delay asking the database about a certain resource until we figure out the IDs of all the records that need to be resolved. Once these IDs are identified, we can use a single query that takes in a list of IDs and returns the list of records for them. This enables us to issue a SQL statement per table, and doing so will reduce the number of SQL statements required for the simple query in listing 7.2 to just two: one for the azdev.tasks table and one for the azdev.users table.
+
+DataLoader is a generic JavaScript utility library that can be injected into your application’s data-fetching layer to manage caching and batching operations on your behalf.
+To use DataLoader in the AZdev API project, we need to install it first.
+
+This npm package has a default export that we usually import as DataLoader. This default export is a JavaScript CLASS that we can use to INSTANTIATE a DataLoader instance. The DataLoader class constructor expects a FUNCTION as its ARGUMENT, and that function is expected to do the data fetching. This function is known as the batchloading function because it expects an ARRAY of key IDs and should fetch all records associated with those IDs in ONE batch action and then return the records as an array that has the same order as the array of input IDs.
+
+import DataLoader from 'dataloader';
+
+const userLoader = new DataLoader(userIds => getUsersByIds(userIds)
+);
+
+The userIds argument is an array, and getUsersByIds is the batch-loading function that takes an array of IDs and returns an array of user records representing these IDs (in order).
+
+THE BATCH-LOADING FUNCTION
+
+A batch-loading function like getUsersByIds in listing 7.4 accepts an array of IDs (or generic keys) and should return a promise object that resolves to an array of records. To be compatible with DataLoader, the resulting array must be the exact same length as the input array of IDs, and each index in the resulting array of records must correspond to the same index in the input array of IDs.
+
+For example, if the getUsersByIds batch function is given the input array of IDs [ 2, 5, 3, 1 ], the function needs to issue one SQL statement to fetch all user records for those IDs. Here’s one way to do that in PostgreSQL.
+
+SELECT \*
+FROM azdev.users
+WHERE id IN (2, 5, 3, 1);
+
+TIP If an ORDER BY clause is not specified in a SELECT statement, the database will pick the most efficient way to satisfy the statement. The order of the returned rows will not be guaranteed.
+
+For the sake of this example, let’s assume that for this SQL statement, the database returned three user records (instead of four) in the following order:
+
+{ id: 5, name: 'Luke' }
+{ id: 1, name: 'Jane' }
+{ id: 2, name: 'Mary' }
+
+The getUsersByIds batch-loading function cannot use the result of that SQL state- ment as is. It needs to reorder the records and ensure that each item aligns with the original order of IDs: [ 2, 5, 3, 1 ]. If an ID has no corresponding record in the result, it should be represented with a null value:
+
+[
+{ id: 2, name: 'Mary' },
+{ id: 5, name: 'Luke' },
+null,
+{ id: 1, name: 'Jane' }
+]
+
+In chapter 6, we wrote the pgApi.userInfo function in api/src/db/pg-api.js. Let’s convert that into a batch-loading function and see what we need to do to make it Data- Loader-compatible.
+First, we should rename it to usersInfo now that it will be used to return an array of user records. We should also rename its argument to userIds to indicate that it expects a list of user IDs.
+
+The sqls.usersFromIds statement is already designed to work with an array of
+user IDs (using the ANY construct).
+
+The ANY comparison construct
+
+There are many ways to fetch multiple records from the database using an array of IDs. The easiest is to use the ANY PostgreSQL comparison construct because we can feed it an array directly (so no array manipulation is needed).
+The SQL statement in listing 7.6 can be written with ANY as follows:
+SELECT \*
+FROM azdev.users
+WHERE id = ANY ('{2, 5, 3, 1}');
+Note that the array syntax in PostgreSQL uses curly brackets instead of square brackets. This might look a bit weird, but we don’t have to deal with this issue ourselves as the driver we’re using will take care of that conversion for us.
+
+We need to change the $1 value we pass to be the new userIds argument, which itself should be an array.
+Finally, we need to reorder the list of user records coming from the database to match the order in the input array of userIds. We can use a simple .map/.find combination to do that.
+Here are all the changes we need to make the pgApi.usersInfo a DataLoader- compatible batch-loading function.
+
+Defining and using a DataLoader instance
+
+DataLoader caching is not meant to be part of your application-level caching that’s shared among requests. It’s meant to be a simple memoization to avoid repeatedly loading the same data in the context of a single request in your application. To do that, you should initialize a loader object for each request in your application and use it only for that request.
+Since we’re using the Express.js framework to manage requests to the AZdev API, to make the “Users loader” scoped to a single request, we can define it inside the listener function of the server.use call in api/src/server.js.
+However, the code currently delegates the entire listener function argument to the graphqlHTTP higher-order function. We’ll need to change that. Here’s one way of doing so.
+
+
